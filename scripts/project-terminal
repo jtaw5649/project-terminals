@@ -1,0 +1,969 @@
+#!/bin/bash
+set -Eeuo pipefail
+
+umask 077
+
+readonly STATE_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/project-terminals"
+readonly PROJECT_STATE_ROOT="$STATE_ROOT/projects"
+readonly CONFIG_ROOT="${XDG_CONFIG_HOME:-$HOME/.config}/project-terminals"
+readonly TMUX_CONFIG="$CONFIG_ROOT/tmux.conf"
+readonly NOTIFICATION_ICON="${XDG_DATA_HOME:-$HOME/.local/share}/project-terminals/icon.png"
+readonly PRIVATE_BIN="$HOME/.local/lib/project-terminal/bin"
+readonly SELF="$HOME/.local/bin/project-terminals"
+readonly PROJECTS_DIR_FILE="$CONFIG_ROOT/projects-dir"
+readonly SHELL_FILE="$CONFIG_ROOT/shell"
+readonly AUTO_RESTORE_FILE="$CONFIG_ROOT/auto-restore"
+readonly WAIT_ONLINE="/usr/lib/systemd/systemd-networkd-wait-online"
+if [[ -f "$PROJECTS_DIR_FILE" ]]; then
+    PROJECTS_ROOT="$(<"$PROJECTS_DIR_FILE")"
+else
+    PROJECTS_ROOT="$HOME/Projects"
+fi
+readonly PROJECTS_ROOT
+readonly USER_RUNTIME_ROOT="${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR is not set}"
+readonly TMUX_RUNTIME_ROOT="$USER_RUNTIME_ROOT/project-terminals"
+readonly FOOT_SOCKET="${PROJECT_TERMINAL_FOOT_SOCKET:-$USER_RUNTIME_ROOT/foot.sock}"
+readonly STATE_LOCK="$STATE_ROOT/state.lock"
+readonly RESTORE_LOCK="$STATE_ROOT/restore.lock"
+
+mkdir -p -- "$PROJECT_STATE_ROOT"
+
+usage() {
+    printf '%s\n' \
+        'Usage: project-terminals COMMAND [ARGUMENT]' \
+        '' \
+        'Commands:' \
+        '  menu                 Show project terminal actions' \
+        '  new [PROJECT]        Open a new terminal for a project' \
+        '  reopen               Reopen a remembered terminal' \
+        '  remove               Permanently remove one terminal' \
+        '  finish [PROJECT]     Stop every process for a project and forget it' \
+        '  restore              Reopen remembered terminals' \
+        '  projects-dir [PATH]  Show or set the projects directory' \
+        '  auto-restore [on|off]  Show or set automatic login restore'
+}
+
+fail() {
+    printf 'project-terminals: %s\n' "$*" >&2
+    return 1
+}
+
+notice() {
+    local message="$1"
+    printf 'project-terminals: %s\n' "$message" >&2
+    if [[ -n "${WAYLAND_DISPLAY:-}" ]] && command -v notify-send >/dev/null 2>&1; then
+        notify-send --icon="$NOTIFICATION_ICON" 'Project terminals' "$message" >/dev/null 2>&1 || true
+    fi
+}
+
+valid_id() {
+    [[ "$1" =~ ^[A-Za-z0-9_.-]+$ ]]
+}
+
+project_state_dir() {
+    local id="$1"
+    valid_id "$id" || return 1
+    printf '%s/%s\n' "$PROJECT_STATE_ROOT" "$id"
+}
+
+slot_state_file() {
+    local id="$1"
+    local slot="$2"
+    valid_id "$id" && valid_id "$slot" || return 1
+    printf '%s/%s/slots/%s.json\n' "$PROJECT_STATE_ROOT" "$id" "$slot"
+}
+
+tmux_socket() {
+    local id="$1"
+    valid_id "$id" || return 1
+    printf '%s/%s/tmux.sock\n' "$TMUX_RUNTIME_ROOT" "$id"
+}
+
+unit_name() {
+    local id="$1"
+    valid_id "$id" || return 1
+    printf 'project-terminal@%s.service\n' "$id"
+}
+
+lock_state() {
+    exec {STATE_LOCK_FD}>"$STATE_LOCK"
+    flock "$STATE_LOCK_FD"
+}
+
+unlock_state() {
+    flock -u "$STATE_LOCK_FD"
+    exec {STATE_LOCK_FD}>&-
+}
+
+resolve_project() {
+    local requested="$1"
+    local root
+    local project
+
+    root="$(realpath -e -- "$PROJECTS_ROOT")" || fail "Projects folder not found: $PROJECTS_ROOT"
+    if [[ "$requested" != /* ]]; then
+        requested="$root/$requested"
+    fi
+    project="$(realpath -e -- "$requested")" || fail "Project not found: $requested"
+    [[ -d "$project" ]] || fail "Not a project folder: $project"
+    [[ "$(dirname -- "$project")" == "$root" ]] || fail "Project must be directly inside $root"
+    [[ "$project" != *$'\n'* ]] || fail 'Project paths containing newlines are unsupported'
+    printf '%s\n' "$project"
+}
+
+projects_dir() {
+    local requested="${1:-}"
+    local root
+    local temporary
+
+    [[ $# -le 1 ]] || fail 'Usage: project-terminals projects-dir [PATH]'
+    if [[ -z "$requested" ]]; then
+        printf '%s\n' "$PROJECTS_ROOT"
+        return 0
+    fi
+
+    root="$(realpath -e -- "$requested")" || fail "Projects folder not found: $requested"
+    [[ -d "$root" ]] || fail "Not a directory: $root"
+    [[ "$root" != *$'\n'* ]] || fail 'Paths containing newlines are unsupported'
+
+    mkdir -p -- "$CONFIG_ROOT"
+    temporary="$(mktemp "$CONFIG_ROOT/.projects-dir.XXXXXX")"
+    printf '%s\n' "$root" >"$temporary"
+    chmod 600 "$temporary"
+    mv -f -- "$temporary" "$PROJECTS_DIR_FILE"
+    printf '%s\n' "$root"
+}
+
+read_auto_restore() {
+    local value='on'
+
+    if [[ -e "$AUTO_RESTORE_FILE" || -L "$AUTO_RESTORE_FILE" ]]; then
+        if [[ ! -f "$AUTO_RESTORE_FILE" || -L "$AUTO_RESTORE_FILE" ]]; then
+            fail "Invalid automatic restore setting: $AUTO_RESTORE_FILE"
+            return 1
+        fi
+        value="$(<"$AUTO_RESTORE_FILE")"
+    fi
+    case "$value" in
+        on|off) ;;
+        *)
+            fail "Invalid automatic restore setting in $AUTO_RESTORE_FILE: $value"
+            return 1
+            ;;
+    esac
+    printf '%s\n' "$value"
+}
+
+auto_restore() {
+    local requested="${1:-}"
+    local temporary
+
+    if (( $# > 1 )); then
+        fail 'Usage: project-terminals auto-restore [on|off]'
+        return 1
+    fi
+    if [[ $# -eq 0 ]]; then
+        read_auto_restore
+        return
+    fi
+    case "$requested" in
+        on|off) ;;
+        *)
+            fail 'Automatic restore must be on or off'
+            return 1
+            ;;
+    esac
+    if [[ -e "$AUTO_RESTORE_FILE" || -L "$AUTO_RESTORE_FILE" ]]; then
+        if [[ ! -f "$AUTO_RESTORE_FILE" || -L "$AUTO_RESTORE_FILE" ]]; then
+            fail "Invalid automatic restore setting: $AUTO_RESTORE_FILE"
+            return 1
+        fi
+    fi
+
+    mkdir -p -- "$CONFIG_ROOT"
+    temporary="$(mktemp "$CONFIG_ROOT/.auto-restore.XXXXXX")"
+    printf '%s\n' "$requested" >"$temporary"
+    chmod 600 "$temporary"
+    mv -f -- "$temporary" "$AUTO_RESTORE_FILE"
+    printf '%s\n' "$requested"
+}
+
+project_id_for_path() {
+    local project="$1"
+    local name
+    local safe_name
+    local hash
+
+    name="$(basename -- "$project")"
+    safe_name="$(printf '%s' "$name" | tr -cs 'A-Za-z0-9_.-' '-')"
+    safe_name="${safe_name:0:40}"
+    [[ -n "$safe_name" ]] || safe_name='project'
+    hash="$(printf '%s' "$project" | sha256sum)"
+    hash="${hash%% *}"
+    printf '%s-%s\n' "$safe_name" "${hash:0:12}"
+}
+
+read_project_path() {
+    local id="$1"
+    local directory
+    directory="$(project_state_dir "$id")"
+    jq -er '.path | strings | select(length > 0)' "$directory/project.json"
+}
+
+project_id_from_argument() {
+    local argument="$1"
+    local project
+
+    if valid_id "$argument" && [[ -f "$PROJECT_STATE_ROOT/$argument/project.json" ]]; then
+        printf '%s\n' "$argument"
+        return 0
+    fi
+    project="$(resolve_project "$argument")"
+    project_id_for_path "$project"
+}
+
+choose() {
+    local prompt="$1"
+    shift
+    [[ $# -gt 0 ]] || return 1
+
+    if [[ -n "${WAYLAND_DISPLAY:-}" ]] && command -v omarchy-launch-walker >/dev/null 2>&1; then
+        printf '%s\n' "$@" | omarchy-launch-walker --dmenu \
+            --width 400 \
+            --minheight 1 \
+            --maxheight 380 \
+            --placeholder "$prompt…"
+    elif [[ -t 0 || -t 1 ]] && command -v fzf >/dev/null 2>&1; then
+        printf '%s\n' "$@" | fzf --prompt "$prompt > "
+    else
+        fail 'No graphical or terminal chooser is available'
+    fi
+}
+
+choose_project() {
+    local root
+    local choice
+    local path
+    local -a paths=()
+    local -a labels=()
+
+    root="$(realpath -e -- "$PROJECTS_ROOT")" || fail "Projects folder not found: $PROJECTS_ROOT"
+    while IFS= read -r -d '' path; do
+        [[ "$path" != *$'\n'* ]] || continue
+        paths+=("$path")
+        labels+=("$(basename -- "$path")")
+    done < <(find "$root" -mindepth 1 -maxdepth 1 -type d -print0 | sort -z)
+
+    [[ ${#paths[@]} -gt 0 ]] || fail "No projects found directly inside $root"
+    choice="$(choose 'Choose project' "${labels[@]}")" || return 1
+    for path in "${paths[@]}"; do
+        if [[ "$(basename -- "$path")" == "$choice" ]]; then
+            printf '%s\n' "$path"
+            return 0
+        fi
+    done
+    return 1
+}
+
+tmux_call() {
+    local id="$1"
+    shift
+    /usr/bin/tmux -N -S "$(tmux_socket "$id")" -f "$TMUX_CONFIG" "$@"
+}
+
+slot_attached() {
+    local id="$1"
+    local slot="$2"
+    local count
+
+    count="$(tmux_call "$id" display-message -p -t "$slot" '#{session_attached}' 2>/dev/null)" || return 1
+    [[ "$count" =~ ^[0-9]+$ ]] && (( count > 0 ))
+}
+
+ensure_service() {
+    local id="$1"
+    local unit
+    local socket
+
+    unit="$(unit_name "$id")"
+    socket="$(tmux_socket "$id")"
+    systemctl --user start "$unit"
+
+    for _ in {1..50}; do
+        [[ -S "$socket" ]] && return 0
+        systemctl --user is-active --quiet "$unit" || break
+        sleep 0.05
+    done
+
+    systemctl --user --no-pager --full status "$unit" >&2 || true
+    fail "tmux server did not start for $id"
+}
+
+ensure_tmux_session() {
+    local id="$1"
+    local slot="$2"
+    local project
+
+    tmux_call "$id" has-session -t "$slot" 2>/dev/null && return 0
+    project="$(read_project_path "$id")" || fail "Missing project state for $id"
+    [[ -d "$project" ]] || fail "Project folder no longer exists: $project"
+    tmux_call "$id" new-session -d -s "$slot" -c "$project" \
+        -e "PROJECT_TERMINAL_PROJECT_ID=$id" \
+        -e "PROJECT_TERMINAL_SLOT_ID=$slot" \
+        "$SELF" run-slot "$id" "$slot"
+}
+
+launch_window() {
+    local id="$1"
+    local slot="$2"
+    local state
+    local project
+    local project_name
+    local number
+    local -a foot=(/usr/bin/footclient --no-wait --client-environment)
+
+    state="$(slot_state_file "$id" "$slot")"
+    project="$(read_project_path "$id")" || return 1
+    project_name="$(basename -- "$project")"
+    number="$(jq -er '.number' "$state")" || return 1
+
+    foot+=(--server-socket "$FOOT_SOCKET")
+    foot+=(--app-id foot --title "$project_name — Terminal $number" --working-directory "$project")
+    "${foot[@]}" /usr/bin/tmux -N -S "$(tmux_socket "$id")" -f "$TMUX_CONFIG" attach-session -t "$slot"
+}
+
+create_slot_state() {
+    local id="$1"
+    local project="$2"
+    local directory
+    local slot
+    local number=1
+    local file
+    local existing_number
+    local temporary
+
+    directory="$(project_state_dir "$id")"
+    lock_state
+    if [[ -e "$directory/discard" || -e "$directory/stopping" ]]; then
+        unlock_state
+        fail 'Project terminals are stopping; try again in a moment'
+        return 1
+    fi
+
+    mkdir -p -- "$directory/slots"
+    if [[ -f "$directory/project.json" ]]; then
+        if [[ "$(jq -er '.path' "$directory/project.json")" != "$project" ]]; then
+            unlock_state
+            fail "Project state collision for $project"
+            return 1
+        fi
+    else
+        temporary="$(mktemp "$directory/.project.XXXXXX")"
+        jq -n \
+            --arg id "$id" \
+            --arg name "$(basename -- "$project")" \
+            --arg path "$project" \
+            '{id: $id, name: $name, path: $path}' >"$temporary"
+        chmod 600 "$temporary"
+        mv -f -- "$temporary" "$directory/project.json"
+    fi
+
+    shopt -s nullglob
+    for file in "$directory"/slots/*.json; do
+        existing_number="$(jq -r '.number // 0' "$file" 2>/dev/null || printf '0')"
+        if [[ "$existing_number" =~ ^[0-9]+$ ]] && (( existing_number >= number )); then
+            number=$((existing_number + 1))
+        fi
+    done
+    shopt -u nullglob
+
+    slot="slot-$(systemd-id128 new | cut -c1-16)"
+    temporary="$(mktemp "$directory/slots/.slot.XXXXXX")"
+    jq -n \
+        --arg id "$slot" \
+        --argjson number "$number" \
+        --arg mode 'shell' \
+        '{id: $id, number: $number, mode: $mode, codex_session_id: null, codex_cwd: null}' >"$temporary"
+    chmod 600 "$temporary"
+    mv -f -- "$temporary" "$directory/slots/$slot.json"
+    unlock_state
+    printf '%s\n' "$slot"
+}
+
+new_terminal() {
+    local project="${1:-}"
+    local id
+    local slot
+    local directory
+
+    if [[ -z "$project" ]]; then
+        project="$(choose_project)" || return 0
+    else
+        project="$(resolve_project "$project")"
+    fi
+    id="$(project_id_for_path "$project")"
+    directory="$(project_state_dir "$id")"
+
+    if [[ -e "$directory/stopping" && ! -e "$directory/discard" ]]; then
+        ensure_service "$id"
+    fi
+
+    slot="$(create_slot_state "$id" "$project")"
+    if ! ensure_service "$id" || ! ensure_tmux_session "$id" "$slot"; then
+        rm -f -- "$(slot_state_file "$id" "$slot")"
+        return 1
+    fi
+    launch_window "$id" "$slot"
+    printf '%s\n' "$slot"
+}
+
+load_slot_choices() {
+    local filter="$1"
+    local state
+    local id
+    local slot
+    local project
+    local project_name
+    local number
+    local mode
+    local suffix
+
+    SLOT_LABELS=()
+    SLOT_VALUES=()
+    while IFS= read -r -d '' state; do
+        id="$(basename -- "$(dirname -- "$(dirname -- "$state")")")"
+        slot="$(basename -- "$state" .json)"
+        project="$(read_project_path "$id" 2>/dev/null)" || continue
+        number="$(jq -r '.number // "?"' "$state" 2>/dev/null)"
+        mode="$(jq -r '.mode // "shell"' "$state" 2>/dev/null)"
+
+        if [[ "$filter" == 'detached' ]] && slot_attached "$id" "$slot"; then
+            continue
+        fi
+
+        project_name="$(basename -- "$project")"
+        suffix='Shell'
+        [[ "$mode" == 'codex' ]] && suffix='Codex'
+        if slot_attached "$id" "$slot"; then
+            suffix="$suffix, open"
+        fi
+        SLOT_LABELS+=("$project_name — Terminal $number ($suffix)")
+        SLOT_VALUES+=("$id:$slot")
+    done < <(find "$PROJECT_STATE_ROOT" -mindepth 3 -maxdepth 3 -type f -path '*/slots/*.json' -print0 | sort -z)
+}
+
+choose_slot() {
+    local filter="$1"
+    local prompt="$2"
+    local choice
+    local index
+
+    load_slot_choices "$filter"
+    if [[ ${#SLOT_LABELS[@]} -eq 0 ]]; then
+        if [[ "$filter" == 'detached' ]]; then
+            notice 'No other project terminals to open.'
+        else
+            notice 'No matching project terminals'
+        fi
+        return 1
+    fi
+    choice="$(choose "$prompt" "${SLOT_LABELS[@]}")" || return 1
+    for index in "${!SLOT_LABELS[@]}"; do
+        if [[ "${SLOT_LABELS[$index]}" == "$choice" ]]; then
+            printf '%s\n' "${SLOT_VALUES[$index]}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+reopen_terminal() {
+    local selection
+    local id
+    local slot
+
+    selection="$(choose_slot detached 'Reopen terminal')" || return 0
+    id="${selection%%:*}"
+    slot="${selection#*:}"
+    ensure_service "$id"
+    ensure_tmux_session "$id" "$slot"
+    launch_window "$id" "$slot"
+}
+
+remove_terminal_by_id() {
+    local id="$1"
+    local slot="$2"
+    local directory
+    local state
+    local last=0
+
+    directory="$(project_state_dir "$id")"
+    state="$(slot_state_file "$id" "$slot")"
+    lock_state
+    if [[ ! -f "$state" ]]; then
+        unlock_state
+        return 0
+    fi
+    : >"$directory/discard-$slot"
+    rm -f -- "$state"
+    if ! find "$directory/slots" -maxdepth 1 -type f -name '*.json' -print -quit | rg -q .; then
+        : >"$directory/stopping"
+        last=1
+    fi
+    unlock_state
+
+    tmux_call "$id" kill-session -t "$slot" 2>/dev/null || true
+    rm -f -- "$directory/discard-$slot"
+    if (( last )); then
+        systemctl --user --no-block stop "$(unit_name "$id")" || notice "Could not stop empty project service: $id"
+    fi
+}
+
+remove_terminal() {
+    local selection
+    local id
+    local slot
+    local confirmation
+
+    selection="$(choose_slot all 'Remove terminal permanently')" || return 0
+    confirmation="$(choose 'Remove this terminal?' 'No' 'Yes — remove it')" || return 0
+    [[ "$confirmation" == 'Yes — remove it' ]] || return 0
+    id="${selection%%:*}"
+    slot="${selection#*:}"
+    remove_terminal_by_id "$id" "$slot"
+}
+
+load_project_choices() {
+    local metadata
+    local id
+    local path
+
+    PROJECT_LABELS=()
+    PROJECT_VALUES=()
+    while IFS= read -r -d '' metadata; do
+        id="$(basename -- "$(dirname -- "$metadata")")"
+        [[ -e "$(dirname -- "$metadata")/discard" ]] && continue
+        path="$(jq -er '.path' "$metadata" 2>/dev/null)" || continue
+        PROJECT_LABELS+=("$(basename -- "$path")")
+        PROJECT_VALUES+=("$id")
+    done < <(find "$PROJECT_STATE_ROOT" -mindepth 2 -maxdepth 2 -type f -name project.json -print0 | sort -z)
+}
+
+choose_active_project() {
+    local choice
+    local index
+
+    load_project_choices
+    if [[ ${#PROJECT_LABELS[@]} -eq 0 ]]; then
+        notice 'No active projects'
+        return 1
+    fi
+    choice="$(choose 'Finish project' "${PROJECT_LABELS[@]}")" || return 1
+    for index in "${!PROJECT_LABELS[@]}"; do
+        if [[ "${PROJECT_LABELS[$index]}" == "$choice" ]]; then
+            printf '%s\n' "${PROJECT_VALUES[$index]}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+finish_worker() {
+    local id="$1"
+    local directory
+    local unit
+    local project_name="$id"
+
+    valid_id "$id" || fail 'Invalid project id'
+    directory="$(project_state_dir "$id")"
+    unit="$(unit_name "$id")"
+    if [[ -f "$directory/project.json" ]]; then
+        project_name="$(jq -r '.name // empty' "$directory/project.json")"
+        [[ -n "$project_name" ]] || project_name="$id"
+    fi
+
+    lock_state
+    if [[ -d "$directory" ]]; then
+        : >"$directory/discard"
+    fi
+    unlock_state
+
+    systemctl --user stop "$unit"
+
+    lock_state
+    if [[ -d "$directory" && -e "$directory/discard" ]]; then
+        rm -rf -- "$directory"
+    fi
+    unlock_state
+    notice "Finished $project_name"
+}
+
+finish_project() {
+    local argument="${1:-}"
+    local id
+    local confirmation
+
+    if [[ -z "$argument" ]]; then
+        id="$(choose_active_project)" || return 0
+        confirmation="$(choose 'Stop every terminal and process?' 'No' 'Yes — finish project')" || return 0
+        [[ "$confirmation" == 'Yes — finish project' ]] || return 0
+    else
+        id="$(project_id_from_argument "$argument")"
+    fi
+
+    if [[ ${PROJECT_TERMINAL_PROJECT_ID:-} == "$id" ]]; then
+        systemd-run --user --collect --no-block \
+            --unit "project-terminal-finish-${id}-$$" \
+            "$SELF" finish-worker "$id" >/dev/null
+    else
+        finish_worker "$id"
+    fi
+}
+
+service_start() {
+    local id="$1"
+    local directory
+
+    directory="$(project_state_dir "$id")"
+    [[ -f "$directory/project.json" ]] || fail "No saved project for $id"
+    [[ ! -e "$directory/discard" ]] || fail "Project $id is being discarded"
+    rm -f -- "$directory/stopping"
+}
+
+service_stop() {
+    local id="$1"
+    local directory
+
+    directory="$(project_state_dir "$id")"
+    [[ -d "$directory" ]] || return 0
+    if [[ -d "$directory/slots" ]] && find "$directory/slots" -maxdepth 1 -type f -name '*.json' -print -quit | rg -q .; then
+        : >"$directory/stopping"
+        return 0
+    fi
+
+    rm -f -- "$directory/project.json" "$directory/stopping" "$directory/discard" "$directory"/discard-*
+    rmdir -- "$directory/slots" "$directory" 2>/dev/null || true
+}
+
+update_slot_codex() {
+    local id="$1"
+    local slot="$2"
+    local session_id="$3"
+    local codex_cwd="$4"
+    local directory
+    local state
+    local temporary
+
+    directory="$(project_state_dir "$id")"
+    state="$(slot_state_file "$id" "$slot")"
+    lock_state
+    if [[ ! -f "$state" || -e "$directory/discard" || -e "$directory/discard-$slot" ]]; then
+        unlock_state
+        return 0
+    fi
+    temporary="$(mktemp "$directory/slots/.codex.XXXXXX")"
+    jq \
+        --arg session_id "$session_id" \
+        --arg cwd "$codex_cwd" \
+        '.mode = "codex" | .codex_session_id = $session_id | .codex_cwd = $cwd' \
+        "$state" >"$temporary"
+    chmod 600 "$temporary"
+    mv -f -- "$temporary" "$state"
+    unlock_state
+}
+
+codex_session_start() {
+    local id="${PROJECT_TERMINAL_PROJECT_ID:-}"
+    local slot="${PROJECT_TERMINAL_SLOT_ID:-}"
+    local payload
+    local session_id
+    local codex_cwd
+
+    payload="$(</dev/stdin)"
+    [[ "${PROJECT_TERMINAL_MANAGED:-}" == '1' ]] || return 0
+    valid_id "$id" && valid_id "$slot" || return 0
+    session_id="$(jq -er 'select(.hook_event_name == "SessionStart") | .session_id | strings | select(length > 0)' <<<"$payload")" || return 0
+    [[ "$session_id" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] || return 0
+    codex_cwd="$(jq -r '.cwd // ""' <<<"$payload")"
+    update_slot_codex "$id" "$slot" "$session_id" "$codex_cwd"
+}
+
+codex_session_ended() {
+    local id="$1"
+    local slot="$2"
+    local directory
+    local state
+    local temporary
+
+    directory="$(project_state_dir "$id")"
+    state="$(slot_state_file "$id" "$slot")"
+    lock_state
+    if [[ ! -f "$state" || -e "$directory/stopping" || -e "$directory/discard" || -e "$directory/discard-$slot" ]]; then
+        unlock_state
+        return 0
+    fi
+    temporary="$(mktemp "$directory/slots/.shell.XXXXXX")"
+    jq '.mode = "shell" | .codex_session_id = null | .codex_cwd = null' "$state" >"$temporary"
+    chmod 600 "$temporary"
+    mv -f -- "$temporary" "$state"
+    unlock_state
+}
+
+slot_ended() {
+    local id="$1"
+    local slot="$2"
+    local directory
+    local state
+    local last=0
+
+    directory="$(project_state_dir "$id")"
+    state="$(slot_state_file "$id" "$slot")"
+    lock_state
+    if [[ -e "$directory/stopping" || -e "$directory/discard" || -e "$directory/discard-$slot" ]]; then
+        unlock_state
+        return 0
+    fi
+    rm -f -- "$state"
+    if ! find "$directory/slots" -maxdepth 1 -type f -name '*.json' -print -quit | rg -q .; then
+        : >"$directory/stopping"
+        last=1
+    fi
+    unlock_state
+
+    if (( last )); then
+        systemctl --user --no-block stop "$(unit_name "$id")" || notice "Could not stop empty project service: $id"
+    fi
+}
+
+resolve_real_codex() {
+    local path_entry
+    local candidate
+    local old_ifs="$IFS"
+
+    IFS=':'
+    for path_entry in $PATH; do
+        [[ -n "$path_entry" ]] || path_entry='.'
+        [[ "$path_entry" == "$PRIVATE_BIN" ]] && continue
+        candidate="$path_entry/codex"
+        if [[ -x "$candidate" && ! -d "$candidate" ]]; then
+            IFS="$old_ifs"
+            realpath -e -- "$candidate"
+            return 0
+        fi
+    done
+    IFS="$old_ifs"
+    return 1
+}
+
+run_slot() {
+    local id="$1"
+    local slot="$2"
+    local directory
+    local state
+    local project
+    local mode
+    local session_id
+    local codex_cwd
+    local shell_path=''
+    local passwd_entry=''
+    local forced=0
+    local status=0
+
+    directory="$(project_state_dir "$id")"
+    state="$(slot_state_file "$id" "$slot")"
+    [[ -f "$state" ]] || fail "Terminal state no longer exists: $slot"
+    project="$(read_project_path "$id")"
+    [[ -d "$project" ]] || fail "Project folder no longer exists: $project"
+
+    if [[ -f "$SHELL_FILE" ]]; then
+        shell_path="$(<"$SHELL_FILE")"
+    else
+        shell_path="${SHELL:-}"
+    fi
+    case "${shell_path##*/}" in
+        bash|zsh|fish) ;;
+        *) shell_path='' ;;
+    esac
+    if [[ "$shell_path" != /* || ! -f "$shell_path" || ! -x "$shell_path" ]]; then
+        passwd_entry="$(getent passwd "$(id -u)" 2>/dev/null || true)"
+        shell_path="${passwd_entry##*:}"
+        case "${shell_path##*/}" in
+            bash|zsh|fish) ;;
+            *) shell_path='' ;;
+        esac
+    fi
+    [[ "$shell_path" == /* && -f "$shell_path" && -x "$shell_path" ]] || shell_path='/bin/bash'
+
+    export PROJECT_TERMINAL_MANAGED=1
+    export PROJECT_TERMINAL_PROJECT_ID="$id"
+    export PROJECT_TERMINAL_SLOT_ID="$slot"
+    export PROJECT_TERMINAL_PROJECT_PATH="$project"
+    export SHELL="$shell_path"
+    export PATH="$PRIVATE_BIN:$PATH"
+
+    mode="$(jq -r '.mode // "shell"' "$state")"
+    session_id="$(jq -r '.codex_session_id // ""' "$state")"
+    codex_cwd="$(jq -r '.codex_cwd // ""' "$state")"
+
+    if [[ "$mode" == 'codex' ]]; then
+        if [[ -n "$session_id" ]]; then
+            if [[ -d "$codex_cwd" ]]; then
+                cd -- "$codex_cwd"
+            else
+                cd -- "$project"
+            fi
+            set +e
+            PROJECT_TERMINAL_RESUME_ID="$session_id" \
+                "$shell_path" -i -c "codex resume \"\$PROJECT_TERMINAL_RESUME_ID\""
+            status=$?
+            set -e
+            if (( status != 0 )); then
+                printf 'Could not resume Codex session %s (exit %d). Starting a shell.\n' "$session_id" "$status" >&2
+            fi
+        else
+            printf 'Saved Codex session is missing an id. Starting a shell.\n' >&2
+            codex_session_ended "$id" "$slot"
+        fi
+    fi
+
+    cd -- "$project"
+    trap 'forced=1' TERM HUP
+    set +e
+    "$shell_path" -i
+    status=$?
+    set -e
+    trap - TERM HUP
+
+    if (( forced == 0 )) && [[ ! -e "$directory/stopping" ]]; then
+        slot_ended "$id" "$slot"
+    fi
+    return "$status"
+}
+
+restore_locked() {
+    local metadata
+    local directory
+    local id
+    local project
+    local state
+    local slot
+    local terminal_count=0
+    local attached_count=0
+
+    while IFS= read -r -d '' metadata; do
+        directory="$(dirname -- "$metadata")"
+        id="$(basename -- "$directory")"
+        [[ -e "$directory/discard" ]] && continue
+        project="$(jq -er '.path' "$metadata" 2>/dev/null)" || continue
+        if [[ ! -d "$project" ]]; then
+            notice "Cannot restore missing project: $project"
+            continue
+        fi
+        if ! ensure_service "$id"; then
+            notice "Could not restore $project"
+            continue
+        fi
+
+        while IFS= read -r -d '' state; do
+            slot="$(basename -- "$state" .json)"
+            terminal_count=$((terminal_count + 1))
+            ensure_tmux_session "$id" "$slot" || continue
+            if slot_attached "$id" "$slot"; then
+                attached_count=$((attached_count + 1))
+            else
+                launch_window "$id" "$slot" || true
+            fi
+        done < <(find "$directory/slots" -maxdepth 1 -type f -name '*.json' -print0 | sort -z)
+    done < <(find "$PROJECT_STATE_ROOT" -mindepth 2 -maxdepth 2 -type f -name project.json -print0 | sort -z)
+
+    if (( terminal_count > 0 && attached_count == terminal_count )); then
+        notice 'All terminals already open.'
+    fi
+}
+
+restore_terminals() {
+    flock --nonblock --close "$RESTORE_LOCK" "$SELF" restore-locked || true
+}
+
+restore_login_worker() {
+    local setting
+
+    setting="$(read_auto_restore)" || return
+    [[ "$setting" == on ]] || return 0
+    if ! "$WAIT_ONLINE" \
+        --quiet \
+        --any \
+        --ipv4 \
+        --operational-state=routable \
+        --timeout=20; then
+        notice 'Network not ready after 20 seconds, restoring terminals anyway'
+    fi
+    setting="$(read_auto_restore)" || return
+    [[ "$setting" == on ]] || return 0
+    restore_terminals
+}
+
+restore_login() {
+    local setting
+
+    setting="$(read_auto_restore)" || return
+    [[ "$setting" == on ]] || return 0
+    systemd-run \
+        --user \
+        --quiet \
+        --collect \
+        --on-active=10s \
+        --timer-property=AccuracySec=1s \
+        --timer-property=RemainAfterElapse=no \
+        -- "$SELF" restore-login-worker
+}
+
+menu() {
+    local action
+    action="$(choose 'Project terminals' \
+        '  New terminal' \
+        '  Reopen terminal' \
+        '  Restore all terminals' \
+        '󰭌  Remove terminal' \
+        '  Finish project')" || return 0
+
+    case "$action" in
+        '  New terminal') new_terminal ;;
+        '  Reopen terminal') reopen_terminal ;;
+        '  Restore all terminals') restore_terminals ;;
+        '󰭌  Remove terminal') remove_terminal ;;
+        '  Finish project') finish_project ;;
+    esac
+}
+
+main() {
+    local command="${1:-}"
+    [[ $# -eq 0 ]] || shift
+
+    case "$command" in
+        menu) menu "$@" ;;
+        new) new_terminal "$@" ;;
+        reopen) reopen_terminal "$@" ;;
+        remove) remove_terminal "$@" ;;
+        finish) finish_project "$@" ;;
+        restore) restore_terminals "$@" ;;
+        projects-dir) projects_dir "$@" ;;
+        auto-restore) auto_restore "$@" ;;
+        run-slot) run_slot "$@" ;;
+        restore-locked) restore_locked "$@" ;;
+        restore-login) restore_login "$@" ;;
+        restore-login-worker) restore_login_worker "$@" ;;
+        service-start) service_start "$@" ;;
+        service-stop) service_stop "$@" ;;
+        finish-worker) finish_worker "$@" ;;
+        codex-session-start) codex_session_start "$@" ;;
+        codex-session-ended) codex_session_ended "$@" ;;
+        resolve-real-codex) resolve_real_codex ;;
+        slot-ended) slot_ended "$@" ;;
+        -h|--help|help) usage ;;
+        '') usage; return 1 ;;
+        *) fail "Unknown command: $command"; usage >&2; return 1 ;;
+    esac
+}
+
+main "$@"

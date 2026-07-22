@@ -1,0 +1,35 @@
+#!/bin/bash
+set -Euo pipefail
+
+readonly MANAGER="$HOME/.local/bin/project-terminals"
+readonly PROJECT_ID="${PROJECT_TERMINAL_PROJECT_ID:-}"
+readonly SLOT_ID="${PROJECT_TERMINAL_SLOT_ID:-}"
+real_codex=''
+
+if [[ "${PROJECT_TERMINAL_MANAGED:-}" != '1' || -z "$PROJECT_ID" || -z "$SLOT_ID" ]]; then
+    printf 'codex: managed terminal markers are missing\n' >&2
+    exit 127
+fi
+real_codex="$("$MANAGER" resolve-real-codex 2>/dev/null || true)"
+if [[ -z "$real_codex" || ! -x "$real_codex" ]]; then
+    printf 'codex: real Codex command was not found\n' >&2
+    exit 127
+fi
+if [[ "$(realpath -e -- "$real_codex")" == "$(realpath -e -- "$0")" ]]; then
+    printf 'codex: refusing recursive wrapper call\n' >&2
+    exit 127
+fi
+
+forced=0
+trap 'forced=1' TERM HUP
+
+status=0
+"$real_codex" "$@" || status=$?
+
+trap - TERM HUP
+if (( forced == 0 )); then
+    "$MANAGER" codex-session-ended "$PROJECT_ID" "$SLOT_ID" || \
+        printf 'codex: could not clear saved session state\n' >&2
+fi
+
+exit "$status"

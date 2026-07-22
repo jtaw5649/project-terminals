@@ -1,0 +1,17 @@
+{
+  "description": "Remember Codex chats in managed project terminals.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.local/bin/project-terminals\" codex-session-start",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,4 @@
+# Keep managed Codex wrapper first after shell setup.
+if [ "${PROJECT_TERMINAL_MANAGED:-}" = 1 ]; then
+    export PATH="$HOME/.local/lib/project-terminal/bin:$PATH"
+fi

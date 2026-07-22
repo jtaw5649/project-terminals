@@ -1,0 +1,4 @@
+# Keep managed Codex wrapper first after shell setup.
+if set -q PROJECT_TERMINAL_MANAGED; and test "$PROJECT_TERMINAL_MANAGED" = 1
+    set -gx PATH "$HOME/.local/lib/project-terminal/bin" $PATH
+end

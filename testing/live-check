@@ -1,0 +1,100 @@
+#!/bin/bash
+set -Eeuo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+project="${1:-$ROOT}"
+[[ $# -le 1 ]] || { printf 'Usage: %s [PROJECT]\n' "$0" >&2; exit 1; }
+
+host_runtime="${XDG_RUNTIME_DIR:?}"
+host_wayland="${WAYLAND_DISPLAY:?}"
+if [[ "$host_wayland" != /* ]]; then
+    host_wayland="$host_runtime/$host_wayland"
+fi
+
+nested_root="$(mktemp -d "$host_runtime/project-terminal-nested.XXXXXX")"
+chmod 700 "$nested_root"
+nested_pid=''
+foot_pid=''
+nested_sig=''
+
+cleanup() {
+    trap - EXIT INT TERM
+    set +e
+    if [[ -n "$foot_pid" ]]; then
+        kill -TERM -- "-$foot_pid" 2>/dev/null || true
+    fi
+    if [[ -n "$nested_sig" ]]; then
+        XDG_RUNTIME_DIR="$nested_root" hyprctl --instance "$nested_sig" dispatch exit >/dev/null 2>&1 || true
+    fi
+    if [[ -n "$nested_pid" ]]; then
+        kill -TERM -- "-$nested_pid" 2>/dev/null || true
+    fi
+    wait "$foot_pid" 2>/dev/null || true
+    wait "$nested_pid" 2>/dev/null || true
+    case "$nested_root" in
+        "$host_runtime"/project-terminal-nested.*)
+            find "$nested_root" -xdev -depth -delete 2>/dev/null || true
+            ;;
+    esac
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+setsid env \
+    XDG_RUNTIME_DIR="$nested_root" \
+    WAYLAND_DISPLAY="$host_wayland" \
+    LIBSEAT_BACKEND=seatd \
+    SEATD_SOCK="$nested_root/missing-seatd.sock" \
+    HYPRLAND_NO_SD_VARS=1 \
+    HYPRLAND_NO_SD_NOTIFY=1 \
+    HYPRLAND_NO_CRASHREPORTER=1 \
+    Hyprland --config "$ROOT/testing/nested.conf" \
+    >"$nested_root/hyprland.log" 2>&1 &
+nested_pid=$!
+
+nested_wayland=''
+for _ in {1..100}; do
+    lock_file=''
+    kill -0 "$nested_pid" 2>/dev/null || break
+    shopt -s nullglob
+    lock_files=("$nested_root"/hypr/*/hyprland.lock)
+    shopt -u nullglob
+    for lock_file in "${lock_files[@]}"; do
+        lock_pid="$(sed -n '1p' "$lock_file")"
+        [[ "$lock_pid" == "$nested_pid" ]] || continue
+        nested_sig="$(basename -- "$(dirname -- "$lock_file")")"
+        nested_wayland="$(sed -n '2p' "$lock_file")"
+        [[ -S "$nested_root/$nested_wayland" ]] && break 2
+    done
+    sleep 0.1
+done
+if [[ -z "$nested_sig" || -z "$nested_wayland" || ! -S "$nested_root/$nested_wayland" ]]; then
+    sed -n '1,220p' "$nested_root/hyprland.log" >&2
+    exit 1
+fi
+
+foot_socket="$nested_root/foot.sock"
+setsid env -u DISPLAY \
+    XDG_RUNTIME_DIR="$nested_root" \
+    WAYLAND_DISPLAY="$nested_wayland" \
+    HYPRLAND_INSTANCE_SIGNATURE="$nested_sig" \
+    foot --server="$foot_socket" >"$nested_root/foot.log" 2>&1 &
+foot_pid=$!
+
+for _ in {1..50}; do
+    [[ -S "$foot_socket" ]] && break
+    kill -0 "$foot_pid" 2>/dev/null || break
+    sleep 0.1
+done
+if [[ ! -S "$foot_socket" ]]; then
+    sed -n '1,160p' "$nested_root/foot.log" >&2
+    exit 1
+fi
+
+slot_one="$(PROJECT_TERMINAL_FOOT_SOCKET="$foot_socket" "$ROOT/scripts/project-terminal" new "$project")"
+slot_two="$(PROJECT_TERMINAL_FOOT_SOCKET="$foot_socket" "$ROOT/scripts/project-terminal" new "$project")"
+
+printf 'NESTED_ROOT=%s\nNESTED_PID=%s\nNESTED_SIG=%s\nNESTED_WAYLAND=%s\nFOOT_SOCKET=%s\nFOOT_PID=%s\nSLOT_ONE=%s\nSLOT_TWO=%s\n' \
+    "$nested_root" "$nested_pid" "$nested_sig" "$nested_wayland" "$foot_socket" "$foot_pid" "$slot_one" "$slot_two"
+wait "$nested_pid"
